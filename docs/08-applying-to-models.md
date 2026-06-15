@@ -30,15 +30,16 @@ from transformers import AutoModelForCausalLM
 from ktune.integrations import apply_ktune_to_model, summarize_patchable
 
 model = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen2.5-0.5B", attn_implementation="flash_attention_2",
+    "Qwen/Qwen2.5-0.5B", attn_implementation="sdpa",
 )
 print(summarize_patchable(model))     # dry run: what would change
 apply_ktune_to_model(model)           # swaps RMSNorm + SwiGLU-MLP forwards
 ```
 
 This swaps every RMSNorm and gated MLP for ktune's fused versions. Attention is
-left to the model's own FlashAttention-2 backend (hence
-`attn_implementation="flash_attention_2"`), and you fuse the LM-head loss
+left to the model's own fused backend — `"sdpa"` is built into PyTorch and always
+available, so it's the safe default; use `"flash_attention_2"` instead only if
+you've installed the separate `flash-attn` package. You fuse the LM-head loss
 separately with `KTuneFusedLinearCrossEntropy`. This mirrors how Liger-Kernel and
 Unsloth patch models.
 

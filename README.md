@@ -88,7 +88,7 @@ from transformers import AutoModelForCausalLM
 from ktune.integrations import apply_ktune_to_model
 
 model = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen2.5-0.5B", attn_implementation="flash_attention_2")
+    "Qwen/Qwen2.5-0.5B", attn_implementation="sdpa")  # or flash_attention_2 if installed
 apply_ktune_to_model(model)        # swaps RMSNorm + SwiGLU-MLP for fused kernels
 ```
 
