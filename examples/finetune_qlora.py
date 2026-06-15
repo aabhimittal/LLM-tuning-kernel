@@ -1,0 +1,160 @@
+"""End-to-end QLoRA fine-tune, with vs without ktune kernels.
+
+This is the "application" payoff: take a small instruct model, fine-tune it with
+4-bit QLoRA, and measure tokens/s + peak VRAM. Pass ``--ktune`` to patch the model
+with ktune's fused kernels and compare.
+
+    # baseline
+    python examples/finetune_qlora.py --model Qwen/Qwen2.5-0.5B --steps 30
+    # with ktune fused kernels
+    python examples/finetune_qlora.py --model Qwen/Qwen2.5-0.5B --steps 30 --ktune
+
+Defaults are tuned for a **free Colab T4**. Requires the ``[app]`` extra:
+    pip install -e ".[app]"
+and a CUDA GPU (QLoRA / bitsandbytes is GPU-only).
+
+The point isn't the resulting model — it's the side-by-side resource numbers.
+Run it both ways and read docs/08-applying-to-models.md for interpretation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
+    ap.add_argument("--dataset", default="yahma/alpaca-cleaned")
+    ap.add_argument("--steps", type=int, default=30)
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--grad-accum", type=int, default=4)
+    ap.add_argument("--seq-len", type=int, default=1024)
+    ap.add_argument("--lora-rank", type=int, default=16)
+    ap.add_argument("--ktune", action="store_true", help="patch the model with ktune kernels")
+    ap.add_argument("--bf16", action="store_true", help="use bf16 (A100); default fp16 (T4)")
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    # Imports are inside main so `--help` works without the heavy [app] deps.
+    try:
+        import torch
+        from datasets import load_dataset
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        from transformers import (
+            AutoModelForCausalLM,
+            AutoTokenizer,
+            BitsAndBytesConfig,
+            DataCollatorForLanguageModeling,
+            Trainer,
+            TrainingArguments,
+        )
+    except ImportError as e:
+        raise SystemExit(
+            f"Missing dependency: {e}. Install the app extra:  pip install -e '.[app]'"
+        ) from e
+
+    if not torch.cuda.is_available():
+        raise SystemExit("This example needs a CUDA GPU (QLoRA/bitsandbytes is GPU-only).")
+
+    compute_dtype = torch.bfloat16 if args.bf16 else torch.float16
+
+    # ---- 4-bit base model (QLoRA) ----
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        quantization_config=bnb,
+        attn_implementation="flash_attention_2",
+        torch_dtype=compute_dtype,
+        device_map={"": 0},
+    )
+    model = prepare_model_for_kbit_training(model)
+
+    # ---- optionally patch in ktune fused kernels ----
+    if args.ktune:
+        from ktune.integrations import apply_ktune_to_model, summarize_patchable
+
+        print("[ktune] patchable modules:", summarize_patchable(model))
+        apply_ktune_to_model(model)
+
+    # ---- LoRA adapters ----
+    lora = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_rank * 2,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora)
+    model.print_trainable_parameters()
+
+    # ---- data ----
+    n_examples = args.steps * args.batch_size * args.grad_accum + 64
+    ds = load_dataset(args.dataset, split=f"train[:{n_examples}]")
+
+    def fmt(ex):
+        instr, inp, out = ex.get("instruction", ""), ex.get("input", ""), ex.get("output", "")
+        prompt = f"### Instruction:\n{instr}\n\n"
+        if inp:
+            prompt += f"### Input:\n{inp}\n\n"
+        prompt += f"### Response:\n{out}"
+        return tokenizer(prompt, truncation=True, max_length=args.seq_len, padding="max_length")
+
+    ds = ds.map(fmt, remove_columns=ds.column_names)
+    collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+
+    targs = TrainingArguments(
+        output_dir="/tmp/ktune-qlora",
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        max_steps=args.steps,
+        learning_rate=2e-4,
+        logging_steps=5,
+        bf16=args.bf16,
+        fp16=not args.bf16,
+        optim="paged_adamw_8bit",
+        report_to=[],
+        gradient_checkpointing=True,
+    )
+    trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
+
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    trainer.train()
+    elapsed = time.perf_counter() - t0
+
+    tokens = args.steps * args.batch_size * args.grad_accum * args.seq_len
+    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+    tag = "ktune" if args.ktune else "baseline"
+    print("\n" + "=" * 60)
+    print(f"[{tag}] steps={args.steps}  time={elapsed:.1f}s")
+    print(f"[{tag}] throughput = {tokens / elapsed:,.0f} tokens/s")
+    print(f"[{tag}] peak VRAM  = {peak_gb:.2f} GB")
+    print("=" * 60)
+    print("Run again with the opposite --ktune setting and compare.")
+
+
+if __name__ == "__main__":
+    main()

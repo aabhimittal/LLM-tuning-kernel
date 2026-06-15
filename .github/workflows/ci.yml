@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    # GPU-less runner: we lint, import the package, and run the CPU *reference*
+    # tests. The Triton kernel tests (-m gpu) are collected but auto-skipped
+    # since there is no CUDA device — they must be run on a GPU (see README).
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU torch + dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu || pip install torch
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Import smoke test
+        run: python -c "import ktune; print('ktune', ktune.__version__, 'triton:', ktune.HAS_TRITON)"
+
+      - name: Confirm GPU tests are collected (and will be skipped here)
+        run: pytest tests/ --collect-only -q
+
+      - name: Run CPU reference tests
+        run: pytest tests/ -v -m "not gpu"

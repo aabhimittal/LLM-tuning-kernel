@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ktune"
+version = "0.1.0"
+description = "Triton kernels for fast, memory-efficient LLM fine-tuning — built to learn."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LLM-tuning-kernel contributors" }]
+keywords = ["triton", "cuda", "llm", "fine-tuning", "lora", "qlora", "kernels", "flash-attention"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# NOTE: torch + triton are intentionally NOT hard dependencies here.
+# Triton kernels require a CUDA GPU to *run*; the pure-PyTorch reference
+# implementations run on CPU. Install the right extra for your machine:
+#   pip install -e .            # core (you bring your own torch)
+#   pip install -e ".[gpu]"     # torch + triton for actual kernel execution
+#   pip install -e ".[dev]"     # tests + lint
+#   pip install -e ".[app]"     # transformers/peft/bitsandbytes for the fine-tuning example
+dependencies = []
+
+[project.optional-dependencies]
+gpu = ["torch>=2.1", "triton>=2.2"]
+app = ["transformers>=4.44", "peft>=0.12", "bitsandbytes>=0.43", "datasets>=2.20", "accelerate>=0.33"]
+dev = ["pytest>=7.0", "ruff>=0.5", "numpy>=1.24"]
+bench = ["matplotlib>=3.7", "pandas>=2.0", "tabulate>=0.9"]
+
+[project.urls]
+Homepage = "https://github.com/aabhimittal/llm-tuning-kernel"
+Documentation = "https://github.com/aabhimittal/llm-tuning-kernel/tree/main/docs"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: marks tests that require a CUDA GPU + Triton (skipped on CPU-only machines)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests", "benchmarks", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# Triton kernels reference globals (tl, triton) and use patterns ruff dislikes; relax there.
+ignore = ["E741"]  # ambiguous variable names (i, l, O are conventional in kernels)

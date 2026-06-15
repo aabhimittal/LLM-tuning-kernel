@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.so
+.venv/
+venv/
+env/
+# benchmark artifacts you generate locally (committed sample results live in benchmarks/results/)
+benchmarks/results/*.png
+!benchmarks/results/.gitkeep
+*.csv
+!benchmarks/results/sample_*.csv
+.DS_Store
