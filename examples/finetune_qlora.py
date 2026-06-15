@@ -34,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lora-rank", type=int, default=16)
     ap.add_argument("--ktune", action="store_true", help="patch the model with ktune kernels")
     ap.add_argument("--bf16", action="store_true", help="use bf16 (A100); default fp16 (T4)")
+    ap.add_argument(
+        "--attn",
+        default="sdpa",
+        choices=["sdpa", "flash_attention_2", "eager"],
+        help="attention backend. sdpa (default) is built into PyTorch and always "
+        "available; flash_attention_2 needs the separately-built flash-attn package.",
+    )
     return ap.parse_args()
 
 
@@ -74,13 +81,20 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
+    model_kwargs = dict(
         quantization_config=bnb,
-        attn_implementation="flash_attention_2",
-        torch_dtype=compute_dtype,
+        attn_implementation=args.attn,
         device_map={"": 0},
     )
+    # `torch_dtype` was renamed to `dtype` in recent transformers; support both.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=compute_dtype, **model_kwargs
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=compute_dtype, **model_kwargs
+        )
     model = prepare_model_for_kbit_training(model)
 
     # ---- optionally patch in ktune fused kernels ----

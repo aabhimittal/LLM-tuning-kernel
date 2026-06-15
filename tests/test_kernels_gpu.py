@@ -64,8 +64,14 @@ def test_flash_attention_kernel(causal):
 def test_cross_entropy_kernel():
     logits = torch.randn(512, 32000, device="cuda", dtype=torch.float32, requires_grad=True)
     targets = torch.randint(0, 32000, (512,), device="cuda")
-    loss = cross_entropy(logits, targets)
+
+    # Snapshot + reference BEFORE the kernel call: the op must not mutate `logits`
+    # even though internally it writes the gradient in place into a private copy.
+    snapshot = logits.detach().clone()
     loss_ref = ref.cross_entropy(logits.detach(), targets)
+
+    loss = cross_entropy(logits, targets)
+    assert torch.equal(logits.detach(), snapshot), "cross_entropy must not modify its input"
     torch.testing.assert_close(loss, loss_ref, atol=1e-3, rtol=1e-3)
     loss.backward()
     assert logits.grad is not None

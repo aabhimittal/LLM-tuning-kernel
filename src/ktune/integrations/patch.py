@@ -10,9 +10,10 @@ of the win:
 * every **RMSNorm** module  ->  ktune fused RMSNorm,
 * every **gated MLP** (``gate_proj``/``up_proj``/``down_proj``)  ->  fused SwiGLU.
 
-Attention is left to the model's own FlashAttention-2 backend (set
-``attn_implementation="flash_attention_2"`` when loading), and the LM-head loss
-can be fused separately with :class:`ktune.nn.KTuneFusedLinearCrossEntropy`.
+Attention is left to the model's own fused backend — load with
+``attn_implementation="sdpa"`` (built into PyTorch, always available) or
+``"flash_attention_2"`` if you've installed the flash-attn package. The LM-head
+loss can be fused separately with :class:`ktune.nn.KTuneFusedLinearCrossEntropy`.
 
 No hard dependency on ``transformers``; everything is duck-typed so importing
 this module never fails on a machine without it.
@@ -76,7 +77,8 @@ def apply_ktune_to_model(model, *, rmsnorm: bool = True, mlp: bool = True, verbo
     if verbose:
         print(
             f"[ktune] patched {patched['rmsnorm']} RMSNorm and {patched['mlp']} "
-            f"SwiGLU-MLP modules. (Load with attn_implementation='flash_attention_2' "
-            f"and use KTuneFusedLinearCrossEntropy for the loss to fuse the rest.)"
+            f"SwiGLU-MLP modules. (Load with attn_implementation='sdpa' (or "
+            f"'flash_attention_2' if installed) and use KTuneFusedLinearCrossEntropy "
+            f"for the loss to fuse the rest.)"
         )
     return model

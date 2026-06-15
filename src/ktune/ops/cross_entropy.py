@@ -80,7 +80,14 @@ if HAS_TRITON:
 class _CrossEntropyTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, targets, ignore_index):
-        logits2d = logits.contiguous().view(-1, logits.shape[-1]).float()
+        # The kernel writes the gradient *in place* into its logits buffer, so we
+        # must hand it a PRIVATE fp32 copy — otherwise we'd silently overwrite the
+        # caller's `logits` with the gradient. Note `.to(float32)`/`.contiguous()`
+        # are no-ops (no copy) when the input is already fp32 + contiguous, so we
+        # add an explicit clone guard for that case.
+        logits2d = logits.detach().to(torch.float32).contiguous().view(-1, logits.shape[-1])
+        if logits2d.data_ptr() == logits.data_ptr():
+            logits2d = logits2d.clone()
         targets = targets.contiguous().view(-1)
         n_rows, vocab = logits2d.shape
         n_valid = (targets != ignore_index).sum().clamp(min=1).item()
