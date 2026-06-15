@@ -59,30 +59,36 @@ the strong reference point.
 ### End-to-end QLoRA (`examples/finetune_qlora.py`) — measured
 
 **Qwen2.5-0.5B, QLoRA (nf4), 30 steps, seq 1024, batch 1 × grad-accum 4, sdpa
-attention, on a Colab T4** (`--ktune` patches RMSNorm + SwiGLU MLP):
+attention, on a Colab T4.**
+
+First run, **`--ktune` patched RMSNorm + SwiGLU only** (loss still computed by HF):
 
 | variant | train loss | throughput | peak VRAM |
 |---------|-----------:|-----------:|----------:|
 | baseline | 1.482 | 1,824 tok/s | 3.07 GB |
-| ktune (RMSNorm + SwiGLU patched) | 1.483 | 1,787 tok/s | 3.07 GB |
+| ktune (RMSNorm + SwiGLU) | 1.483 | 1,787 tok/s | 3.07 GB |
 
 **How to read this — an honest result:**
 
 - **Correctness ✓.** The loss curves are step-for-step identical (1.482 vs 1.483).
   The fused kernels change *how* the math runs, not *what* it computes.
-- **No memory change**, because the patcher only swaps RMSNorm + SwiGLU. The two
-  memory-dominant kernels are **not engaged in this configuration**: the loss
-  still flows through HF's own `lm_head` + cross-entropy (not
-  `KTuneFusedLinearCrossEntropy`), and attention runs on `sdpa` (not a path that
-  materialises the big score matrix). There is simply nothing here for FLCE /
-  FlashAttention to save.
+- **No memory change in that first run**, because the patcher only swapped RMSNorm
+  + SwiGLU — the memory-dominant kernels weren't engaged: the loss flowed through
+  HF's own `lm_head` + cross-entropy, and attention ran on `sdpa`.
 - **No speedup at this scale**, in fact ~2% slower. At 0.5B the patched
   element-wise ops are a small slice of total runtime, and these kernels are
   **not `@triton.autotune`'d** — fixed block sizes mean launch overhead roughly
   cancels the bandwidth they save. Memory-bound kernels need autotuning and a
   larger model to pull clearly ahead.
 
-**Where the wins actually appear** (run these to see them in isolation):
+> **Update:** `--ktune` now also routes the loss through
+> **FusedLinearCrossEntropy** by default (toggle with `--flce` / `--no-flce`), so
+> the `[tokens, vocab]` logits are no longer materialised during the loss. Re-run
+> and paste the new `peak VRAM` here — the drop scales with `vocab × seq`, so it's
+> modest at Qwen's 32k vocab + seq 1024 and grows substantially at 128k vocab or
+> longer context. (To stress it on the same hardware, try `--seq 2048`.)
+
+**Where the wins are largest** (run these to see them in isolation):
 
 - `bench_flce.py` — the FusedLinearCrossEntropy memory drop, which grows with
   vocab size (negligible at 32k, large at 128k+).

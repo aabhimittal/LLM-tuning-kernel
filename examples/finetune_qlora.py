@@ -6,8 +6,12 @@ with ktune's fused kernels and compare.
 
     # baseline
     python examples/finetune_qlora.py --model Qwen/Qwen2.5-0.5B --steps 30
-    # with ktune fused kernels
+    # with ktune fused kernels (also fuses the loss via FusedLinearCrossEntropy)
     python examples/finetune_qlora.py --model Qwen/Qwen2.5-0.5B --steps 30 --ktune
+
+``--ktune`` patches RMSNorm + SwiGLU and, by default, also routes the loss through
+FusedLinearCrossEntropy so the LM-head logits are never materialised (the real
+memory win). Toggle that independently with ``--flce`` / ``--no-flce``.
 
 Defaults are tuned for a **free Colab T4**. Requires the ``[app]`` extra:
     pip install -e ".[app]"
@@ -33,6 +37,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--lora-rank", type=int, default=16)
     ap.add_argument("--ktune", action="store_true", help="patch the model with ktune kernels")
+    ap.add_argument(
+        "--flce",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="route the loss through FusedLinearCrossEntropy so the LM-head logits "
+        "are never materialised (the real memory win). Defaults to ON when --ktune.",
+    )
     ap.add_argument("--bf16", action="store_true", help="use bf16 (A100); default fp16 (T4)")
     ap.add_argument(
         "--attn",
@@ -46,6 +57,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.flce is None:  # default: fuse the loss whenever we're using ktune
+        args.flce = args.ktune
 
     # Imports are inside main so `--help` works without the heavy [app] deps.
     try:
@@ -152,7 +165,54 @@ def main() -> None:
         report_to=[],
         gradient_checkpointing=True,
     )
-    trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
+    if args.flce:
+        from ktune.integrations import fused_causal_lm_loss
+
+        class FLCETrainer(Trainer):
+            """Computes the LM loss with FusedLinearCrossEntropy.
+
+            We temporarily swap the model's output embedding (``lm_head``) for a
+            hook that captures its *input* (the hidden states) and returns cheap
+            dummy logits, so the model never forms the full ``[batch, seq, vocab]``
+            logits tensor. The real loss is then computed from the hidden states +
+            LM-head weight via the chunked FLCE kernel.
+            """
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                labels = inputs.pop("labels")
+                lm_head = model.get_output_embeddings()
+                if lm_head is None:
+                    raise RuntimeError("model has no output embeddings; can't fuse the loss")
+
+                captured = {}
+                original_forward = lm_head.forward
+
+                def capture(x, *a, **k):
+                    captured["hidden"] = x
+                    return x[..., :1]  # dummy logits — the body never sees full vocab
+
+                lm_head.forward = capture
+                try:
+                    model(**inputs)
+                finally:
+                    lm_head.forward = original_forward
+
+                if "hidden" not in captured:
+                    raise RuntimeError("FLCE loss: the model never called its output embedding")
+                loss = fused_causal_lm_loss(
+                    captured["hidden"],
+                    lm_head.weight,
+                    labels,
+                    bias=getattr(lm_head, "bias", None),
+                    ignore_index=-100,
+                    chunk_size=1024,
+                )
+                return (loss, {}) if return_outputs else loss
+
+        print("[ktune] loss fused via FusedLinearCrossEntropy (logits never materialised)")
+        trainer = FLCETrainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
+    else:
+        trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
 
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()

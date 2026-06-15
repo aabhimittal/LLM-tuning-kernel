@@ -67,11 +67,13 @@ both on a free T4.
   launch overhead cancels the bandwidth they save. A clear speedup needs
   autotuning and/or a larger model.
 - **Peak VRAM.** The big wins live in **FusedLinearCrossEntropy** and
-  **FlashAttention** — but they only help when they're actually in the hot path.
-  The default patcher does *not* engage them (the loss flows through HF's own
-  `lm_head` + CE, attention through `sdpa`), so peak VRAM is unchanged in the
-  example. To see the memory drop, run `bench_flce.py` / `bench_attention.py`, or
-  route the loss through `KTuneFusedLinearCrossEntropy` and train at long context
-  / large vocab.
+  **FlashAttention**, and they only help when they're in the hot path. The example
+  now routes the loss through FLCE by default under `--ktune` (see the
+  `FLCETrainer` in `examples/finetune_qlora.py`, built on
+  `ktune.integrations.fused_causal_lm_loss`), so the `[tokens, vocab]` logits are
+  never materialised. The size of the drop scales with `vocab × seq` — modest at a
+  32k vocab + short context, large at 128k vocab or long context. Attention is
+  still left to `sdpa` here; run `bench_attention.py` to see FlashAttention's
+  separate memory win.
 
 See `benchmarks/RESULTS.md` for the full measured numbers and interpretation.

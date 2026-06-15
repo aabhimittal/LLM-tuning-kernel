@@ -63,8 +63,10 @@ def _chunk_ce_and_grad(logits, targets, inv_n_valid, ignore_index):
         )
         return loss_per_row.sum(), logits  # logits now holds d_logits
 
-    # CPU reference: identical math, written for clarity.
-    logits = logits.float()
+    # CPU reference: identical math, written for clarity. Upcast low-precision
+    # inputs to fp32 for numerical stability, but never *down*cast (so fp64 stays
+    # exact — the GPU kernel likewise accumulates in fp32).
+    logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
     logp = F.log_softmax(logits, dim=-1)
     valid = targets != ignore_index
     safe_targets = targets.clamp(min=0)

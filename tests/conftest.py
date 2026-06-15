@@ -15,6 +15,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+
+@pytest.fixture(autouse=True)
+def _seed():
+    """Seed before every test so unseeded random tensors are reproducible."""
+    torch.manual_seed(0)
+
+
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="needs a CUDA GPU + Triton to run the kernels",
