@@ -58,13 +58,22 @@ both on a free T4.
 
 ## How to read the benchmark numbers
 
-- **Throughput (tokens/s).** The fused element-wise kernels (RMSNorm, SwiGLU,
-  RoPE) cut HBM traffic; expect a modest but real end-to-end speedup.
-- **Peak VRAM.** This is where the big wins live — FusedLinearCrossEntropy and
-  FlashAttention remove the two largest activations. Lower peak VRAM means you can
-  raise batch size or sequence length, which *then* raises throughput again.
 - **Loss curve.** Should be essentially identical to the baseline — these kernels
   change *how* the math is computed, not *what* is computed. If the loss diverges,
-  that's a bug, not a feature.
+  that's a bug, not a feature. (Measured: 1.482 vs 1.483 — see `RESULTS.md`.)
+- **Throughput (tokens/s).** Be calibrated: the element-wise patcher (RMSNorm +
+  SwiGLU) is roughly **neutral at small scale** — on a 0.5B model those ops are a
+  small slice of runtime, and the kernels here aren't `@triton.autotune`'d, so
+  launch overhead cancels the bandwidth they save. A clear speedup needs
+  autotuning and/or a larger model.
+- **Peak VRAM.** The big wins live in **FusedLinearCrossEntropy** and
+  **FlashAttention**, and they only help when they're in the hot path. The example
+  now routes the loss through FLCE by default under `--ktune` (see the
+  `FLCETrainer` in `examples/finetune_qlora.py`, built on
+  `ktune.integrations.fused_causal_lm_loss`), so the `[tokens, vocab]` logits are
+  never materialised. The size of the drop scales with `vocab × seq` — modest at a
+  32k vocab + short context, large at 128k vocab or long context. Attention is
+  still left to `sdpa` here; run `bench_attention.py` to see FlashAttention's
+  separate memory win.
 
-See `benchmarks/RESULTS.md` for the harness output and reference numbers.
+See `benchmarks/RESULTS.md` for the full measured numbers and interpretation.

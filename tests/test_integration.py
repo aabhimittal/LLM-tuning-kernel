@@ -10,7 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ktune.integrations import apply_ktune_to_model, summarize_patchable
+from ktune.integrations import (
+    apply_ktune_to_model,
+    fused_causal_lm_loss,
+    summarize_patchable,
+)
 from ktune.nn import KTuneFusedLinearCrossEntropy, KTuneRMSNorm, KTuneSwiGLUMLP
 
 
@@ -38,6 +42,27 @@ def test_ktune_flce_module_matches_unfused():
     loss = m(hidden, weight, targets)
     ref = F.cross_entropy(F.linear(hidden, weight), targets)
     torch.testing.assert_close(loss.double(), ref)
+
+
+def test_fused_causal_lm_loss_matches_unfused():
+    b, s, h, v = 2, 9, 12, 40
+    hidden = torch.randn(b, s, h, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(v, h, dtype=torch.float64, requires_grad=True)
+    labels = torch.randint(0, v, (b, s))
+    labels[:, :2] = -100  # some ignored (e.g. prompt / padding)
+
+    loss = fused_causal_lm_loss(hidden, weight, labels, chunk_size=7)
+
+    # Unfused reference: project all logits, shift, standard cross-entropy.
+    logits = F.linear(hidden, weight)[:, :-1].reshape(-1, v)
+    targets = labels[:, 1:].reshape(-1)
+    ref = F.cross_entropy(logits, targets, ignore_index=-100)
+    torch.testing.assert_close(loss.double(), ref)
+
+    gh, gW = torch.autograd.grad(loss, (hidden, weight))
+    gh_ref, gW_ref = torch.autograd.grad(ref, (hidden, weight))
+    torch.testing.assert_close(gh, gh_ref)
+    torch.testing.assert_close(gW, gW_ref)
 
 
 class _FakeRMSNorm(nn.Module):

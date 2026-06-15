@@ -56,11 +56,48 @@ the strong reference point.
 | 4k | ~16× the 1k matrix | roughly flat |
 | 8k+ | often OOM on a T4 | still fits |
 
-### End-to-end QLoRA (`examples/finetune_qlora.py`)
+### End-to-end QLoRA (`examples/finetune_qlora.py`) — measured
 
-Across the whole fine-tune, the combination (fused RMSNorm + SwiGLU + FLCE +
-FlashAttention-2 backend) is in the ballpark Unsloth reports: **~1.5–2× faster
-training and ~40–60% less VRAM** for small models on a single GPU — with an
-essentially identical loss curve.
+**Qwen2.5-0.5B, QLoRA (nf4), 30 steps, seq 1024, batch 1 × grad-accum 4, sdpa
+attention, on a Colab T4.**
 
-> Replace this section with your measured `[baseline]` vs `[ktune]` output.
+First run, **`--ktune` patched RMSNorm + SwiGLU only** (loss still computed by HF):
+
+| variant | train loss | throughput | peak VRAM |
+|---------|-----------:|-----------:|----------:|
+| baseline | 1.482 | 1,824 tok/s | 3.07 GB |
+| ktune (RMSNorm + SwiGLU) | 1.483 | 1,787 tok/s | 3.07 GB |
+
+**How to read this — an honest result:**
+
+- **Correctness ✓.** The loss curves are step-for-step identical (1.482 vs 1.483).
+  The fused kernels change *how* the math runs, not *what* it computes.
+- **No memory change in that first run**, because the patcher only swapped RMSNorm
+  + SwiGLU — the memory-dominant kernels weren't engaged: the loss flowed through
+  HF's own `lm_head` + cross-entropy, and attention ran on `sdpa`.
+- **No speedup at this scale**, in fact ~2% slower. At 0.5B the patched
+  element-wise ops are a small slice of total runtime, and these kernels are
+  **not `@triton.autotune`'d** — fixed block sizes mean launch overhead roughly
+  cancels the bandwidth they save. Memory-bound kernels need autotuning and a
+  larger model to pull clearly ahead.
+
+> **Update:** `--ktune` now also routes the loss through
+> **FusedLinearCrossEntropy** by default (toggle with `--flce` / `--no-flce`), so
+> the `[tokens, vocab]` logits are no longer materialised during the loss. Re-run
+> and paste the new `peak VRAM` here — the drop scales with `vocab × seq`, so it's
+> modest at Qwen's 32k vocab + seq 1024 and grows substantially at 128k vocab or
+> longer context. (To stress it on the same hardware, try `--seq 2048`.)
+
+**Where the wins are largest** (run these to see them in isolation):
+
+- `bench_flce.py` — the FusedLinearCrossEntropy memory drop, which grows with
+  vocab size (negligible at 32k, large at 128k+).
+- `bench_attention.py --seq 4096/8192` — FlashAttention's flat-vs-quadratic
+  memory as sequence length grows.
+
+To get an end-to-end win you have to put those kernels *in the hot path*: route
+the loss through `KTuneFusedLinearCrossEntropy` (a custom `Trainer.compute_loss`)
+and/or train at long context + large vocab. The element-wise patcher alone is
+best understood as "free correctness-preserving fusion that's roughly neutral at
+small scale", not a speed button.
+
