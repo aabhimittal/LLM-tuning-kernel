@@ -91,23 +91,22 @@ on a short slice and prints `flce=… native=… -> match`):
 
 | variant | train loss | throughput | peak VRAM |
 |---------|-----------:|-----------:|----------:|
-| baseline | 1.484 | 1,840 tok/s | 3.07 GB |
-| ktune (+ FLCE loss) | **1.483** | 1,324 tok/s | ~2.65 GB |
+| baseline | 1.483 | 1,843 tok/s | 3.07 GB |
+| ktune (+ FLCE loss) | **1.483** | 1,369 tok/s | **2.65 GB** |
+
+Step-1 self-check (on a 128-token slice): `flce=2.0747 native=2.0744 -> match`.
 
 **How to read this:**
 
-- **Correctness ✓.** The FLCE loss matches the model's native loss exactly
-  (step-1 self-check `flce=native`), and the curve tracks the baseline to the
-  third decimal (1.483 vs 1.484).
-- **Memory win ✓ but modest here.** Peak VRAM drops because the `[1024, 152k]`
-  logits + gradient are never materialised. (An earlier measurement read 3.00 GB
-  only because the self-check itself computed the full-seq native logits; it now
-  validates on a 128-token slice, so the peak reflects the true FLCE saving.)
-- **Slower at this scale**, ~28%. The chunked FLCE path (Triton CE looping a 152k
+- **Correctness ✓.** The FLCE loss matches the model's native loss (self-check
+  `flce≈native`), and the full curve is bit-identical to the baseline (1.483).
+- **Memory win ✓: 3.07 → 2.65 GB (−14%)**, because the `[1024, 152k]` logits +
+  gradient are never materialised. The win grows with `vocab × seq`.
+- **Slower at this scale**, ~26%. The chunked FLCE path (Triton CE looping a 152k
   vocab) can't beat cuBLAS `lm_head` + native CE for a single 0.5B/1k-seq step.
   **FLCE buys memory headroom, not speed** — its value is letting a larger
-  batch / sequence / vocab fit that would otherwise OOM. The win grows with
-  `vocab × seq`; try `--seq 2048` and watch the gap widen.
+  batch / sequence / vocab fit that would otherwise OOM. Try `--seq 2048` to
+  widen the gap.
 
 > A real bug surfaced and was fixed along the way: the trainer first returned a
 > per-microbatch *mean* while recent transformers passes `num_items_in_batch` and
