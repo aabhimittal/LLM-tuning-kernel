@@ -29,10 +29,13 @@ gradients with the standard identities::
     dS = P ∘ (dP - D)
     dQ = scale · dS @ K ,  dK = scale · dSᵀ @ Q
 
-One program owns a query block and accumulates its ``dQ`` locally; the ``dK``/
-``dV`` contributions to each key block are accumulated across query blocks with
-``tl.atomic_add`` (a clean single-kernel design — the two-pass, atomic-free
-formulation is the follow-up exercise in ``docs/07-flash-attention.md``).
+``D = rowsum(dO ∘ O)`` is precomputed on the host (the FA-2 "preprocess" step) so
+the kernel needn't hold ``O`` in SRAM. One program owns a query block and
+accumulates its ``dQ`` locally; the ``dK``/``dV`` contributions to each key block
+are accumulated across query blocks with ``tl.atomic_add`` (a clean single-kernel
+design — the two-pass, atomic-free formulation is the follow-up exercise in
+``docs/07-flash-attention.md``). Backward tiles are kept small (and
+``num_stages=1``) so the extra live tensors fit a T4's 64 KB shared memory.
 
 Set :data:`USE_FUSED_BACKWARD` to ``False`` to fall back to the autograd-recompute
 backward (handy for A/B-checking the fused kernel).
@@ -130,7 +133,7 @@ if HAS_TRITON:
         q_ptr,
         k_ptr,
         v_ptr,
-        o_ptr,
+        delta_ptr,  # [B*H, seq] precomputed D = rowsum(dO ∘ O)
         do_ptr,
         l_ptr,  # [B*H, seq] log-sum-exp from the forward
         dq_ptr,
@@ -157,13 +160,9 @@ if HAS_TRITON:
         do = tl.load(
             do_ptr + base + row[:, None] * BLOCK_D + d[None, :], mask=row_mask[:, None], other=0.0
         ).to(tl.float32)
-        o = tl.load(
-            o_ptr + base + row[:, None] * BLOCK_D + d[None, :], mask=row_mask[:, None], other=0.0
-        ).to(tl.float32)
         L = tl.load(l_ptr + off_bh * seq + row, mask=row_mask, other=0.0)
-
-        # D_i = rowsum(dO_i ∘ O_i) — the term that makes dS a centred softmax grad.
-        Di = tl.sum(do * o, axis=1)  # [BLOCK_M]
+        # D_i = rowsum(dO_i ∘ O_i), precomputed on the host so we needn't load O here.
+        Di = tl.load(delta_ptr + off_bh * seq + row, mask=row_mask, other=0.0)
         dq = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
 
         end_n = (start_m + 1) * BLOCK_M if CAUSAL else seq
@@ -235,18 +234,22 @@ if HAS_TRITON:
         v2 = v.reshape(b * h, seq, d).contiguous()
         o2 = o.reshape(b * h, seq, d).contiguous()
         do2 = do.reshape(b * h, seq, d).contiguous()
+        # Precompute D = rowsum(dO ∘ O) on the host (the FA-2 "preprocess" step) so
+        # the kernel needn't hold O in SRAM — keeps it under the shared-memory cap.
+        delta = (do2.float() * o2.float()).sum(dim=-1)  # [B*H, seq]
         # dK/dV are accumulated with atomics, so they must start at zero in fp32.
         dq = torch.zeros_like(q2, dtype=torch.float32)
         dk = torch.zeros_like(k2, dtype=torch.float32)
         dv = torch.zeros_like(v2, dtype=torch.float32)
-        block_m = min(64, triton.next_power_of_2(seq))
-        block_n = min(64, triton.next_power_of_2(seq))
-        grid = (triton.cdiv(seq, block_m), b * h)
+        # Smaller tiles than the forward: the backward keeps more tiles live at once
+        # (q, do, dq, k, v, s, p, dp, ds), so 32 + num_stages=1 fits a T4's 64 KB SRAM.
+        block = min(32, triton.next_power_of_2(seq))
+        grid = (triton.cdiv(seq, block), b * h)
         _flash_bwd_kernel[grid](
             q2,
             k2,
             v2,
-            o2,
+            delta,
             do2,
             lse,
             dq,
@@ -255,9 +258,10 @@ if HAS_TRITON:
             sm_scale,
             seq,
             CAUSAL=causal,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
+            BLOCK_M=block,
+            BLOCK_N=block,
             BLOCK_D=d,
+            num_stages=1,
         )
         return (
             dq.reshape(b, h, seq, d).to(q.dtype),
