@@ -28,6 +28,12 @@ if HAS_TRITON:
     import triton
     import triton.language as tl
 
+    # These row-wise kernels must size BLOCK to cover the whole row (one program
+    # per row), so BLOCK is fixed per call — but the best *number of warps* still
+    # depends on the row width, so we autotune over that, keyed on n_cols.
+    _WARP_CONFIGS = [triton.Config({}, num_warps=w) for w in (1, 2, 4, 8)]
+
+    @triton.autotune(configs=_WARP_CONFIGS, key=["n_cols"])
     @triton.jit
     def _rmsnorm_fwd_kernel(
         x_ptr,  # [n_rows, n_cols] input
@@ -60,6 +66,7 @@ if HAS_TRITON:
         y = x * rstd * w
         tl.store(y_ptr + cols, y, mask=mask)
 
+    @triton.autotune(configs=_WARP_CONFIGS, key=["n_cols"])
     @triton.jit
     def _rmsnorm_bwd_kernel(
         dy_ptr,  # incoming gradient [n_rows, n_cols]

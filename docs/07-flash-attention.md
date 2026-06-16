@@ -54,23 +54,32 @@ That alone halves the work; within the boundary tile we mask `col > row`.
 
 ## What this repo ships
 
-The **forward kernel** is implemented in full — it's the part worth learning, and
-it's checked against the reference on GPU in `tests/test_kernels_gpu.py`.
+Both the **forward and backward** are fused Triton kernels, checked against the
+reference on GPU in `tests/test_kernels_gpu.py`.
 
-The **backward** currently recomputes gradients via autograd on the reference
-formula. That is numerically correct and a clean baseline, but it re-materialises
-the score matrix, so it is *not* memory-optimal. Fusing the backward is the
-natural capstone exercise (below).
+* The forward writes the per-row log-sum-exp `L = m + log(l)`.
+* The backward (`_flash_bwd_kernel`) reuses `L` to **recompute** the softmax
+  probabilities one `[BLOCK_M, BLOCK_N]` tile at a time — so it too never
+  materialises the `[seq, seq]` matrix — and forms the gradients via
+  `D = rowsum(dO ∘ O)`, `dV = Pᵀ dO`, `dS = P ∘ (dO Vᵀ - D)`,
+  `dQ = scale·dS K`, `dK = scale·dSᵀ Q`.
+
+To keep it a single, readable kernel, each program owns a query block and
+accumulates its `dQ` locally, while the `dK`/`dV` contributions to each key block
+are summed across query blocks with `tl.atomic_add`. Set
+`ktune.ops.flash_attention.USE_FUSED_BACKWARD = False` to A/B against the
+autograd-recompute fallback.
 
 ## Exercises
 
-1. Store the per-row logsumexp `L = m + log(l)` from the forward (the kernel
-   already computes `m` and `l`) — you'll need it for a fused backward.
-2. Implement the FlashAttention-2 **backward** in Triton: compute `D = rowsum(dO ∘
-   O)`, then a `dK`/`dV` loop and a `dQ` loop, all tiled. Verify against the
-   reference and benchmark the memory drop vs the recompute path.
-3. Add support for non-power-of-two `head_dim` via masking on the `D` axis.
-4. Add a sliding-window / block-sparse mask and skip key blocks entirely outside
+1. Replace the atomics with the classic **two-pass, atomic-free** backward: one
+   kernel parallel over key blocks (accumulating `dK`/`dV` with an inner query
+   loop) and one parallel over query blocks (for `dQ`). Compare speed vs the
+   atomic version here.
+2. Add support for non-power-of-two `head_dim` via masking on the `D` axis.
+3. Add a sliding-window / block-sparse mask and skip key blocks entirely outside
    the window.
+4. Autotune `BLOCK_M`/`BLOCK_N`/`num_warps` for the forward and backward and plot
+   the speedup vs sequence length.
 
 Next: [08 · Applying to models](08-applying-to-models.md).

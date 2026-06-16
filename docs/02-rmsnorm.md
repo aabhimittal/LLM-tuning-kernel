@@ -58,7 +58,9 @@ On CPU the exact same call runs the reference. Compare the two files line by lin
 
 1. Fuse an optional `residual` add (`x = x + residual`) into the kernel so the
    residual stream never round-trips through HBM.
-2. Add `@triton.autotune` over `num_warps ∈ {1,2,4,8}` and plot latency vs `H`.
+2. The fwd/bwd kernels are already `@triton.autotune`'d over `num_warps` (keyed on
+   `n_cols`). Add `num_stages` to the configs and plot latency vs `H` — where does
+   more warps stop helping?
 3. Implement LayerNorm by adding the mean-subtraction — what extra reduction and
    what extra backward term appear?
 

@@ -131,9 +131,11 @@ Expected wins and how to reproduce: [`benchmarks/RESULTS.md`](benchmarks/RESULTS
 
 ## Status & honesty
 
-- All kernels ship with fwd+bwd **except FlashAttention**, whose backward
-  currently recomputes via autograd (correct but not yet memory-optimal). Fusing
-  it in Triton is the capstone exercise in [doc 07](docs/07-flash-attention.md).
+- All kernels ship with fused **forward + backward**, including FlashAttention-2
+  (the backward recomputes the softmax tile-by-tile and uses `tl.atomic_add` for
+  `dK`/`dV`; toggle `USE_FUSED_BACKWARD` to A/B against the recompute fallback).
+- The element-wise/reduction kernels (RMSNorm, SwiGLU, RoPE) are `@triton.autotune`'d
+  over block size / warp count.
 - The CPU reference suite is verified green; the Triton kernels must be verified on
   a GPU (the Colab notebook does this in one cell).
 
