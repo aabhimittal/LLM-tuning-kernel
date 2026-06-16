@@ -37,12 +37,16 @@ but compound across a full training step.
 The flagship. The win grows with vocab size because the avoided `[tokens, vocab]`
 logits tensor grows with it.
 
-| vocab | expected peak-memory reduction (loss step) |
-|-------|--------------------------------------------|
-| 32k (Qwen2.5) | ~2–3× |
-| 128k (Llama-3) | **~4×+** |
+**Measured (`bench_flce.py --hardware t4`, T4, 4096 tokens × hidden 2048, vocab 32k):**
 
-Liger-Kernel reports **>4× memory reduction at 128k vocab** for this kernel.
+| variant | peak mem | fwd+bwd |
+|---------|---------:|--------:|
+| baseline (`lm_head` + CE) | 1877 MB | 377 ms |
+| ktune (FLCE) | 1297 MB | 379 ms |
+
+→ **1.45× peak-memory reduction at 32k vocab**, same speed. The reduction grows
+with vocab (≈2–3× at 32k for larger token counts, **>4× at 128k** per Liger-Kernel)
+because the avoided logits/gradient tensors scale with vocab.
 
 ### FlashAttention forward (`bench_attention.py`)
 
@@ -81,12 +85,17 @@ First run, **`--ktune` patched RMSNorm + SwiGLU only** (loss still computed by H
   cancels the bandwidth they save. Memory-bound kernels need autotuning and a
   larger model to pull clearly ahead.
 
-> **Update:** `--ktune` now also routes the loss through
-> **FusedLinearCrossEntropy** by default (toggle with `--flce` / `--no-flce`), so
-> the `[tokens, vocab]` logits are no longer materialised during the loss. Re-run
-> and paste the new `peak VRAM` here — the drop scales with `vocab × seq`, so it's
-> modest at Qwen's 32k vocab + seq 1024 and grows substantially at 128k vocab or
-> longer context. (To stress it on the same hardware, try `--seq 2048`.)
+Second run, **`--ktune` with the loss routed through FusedLinearCrossEntropy**:
+peak VRAM dropped **3.07 → 2.65 GB** (logits no longer materialised). The first
+attempt also exposed a real integration bug — the loss read ~7.3 instead of ~1.7
+because the custom `Trainer` returned a per-microbatch *mean* while recent
+transformers passes `num_items_in_batch` and skips the grad-accum division
+(expecting `sum / num_items`), making the loss/grads ~`grad_accum`× too large.
+
+**Fixed:** the `FLCETrainer` now honours `num_items_in_batch` and self-checks its
+loss against the model's native loss on step 1, falling back to the native loss
+if they ever diverge. Re-run `--ktune` for the corrected loss curve (should track
+the baseline) alongside the ~14% VRAM drop; try `--seq 2048` for a larger gap.
 
 **Where the wins are largest** (run these to see them in isolation):
 
