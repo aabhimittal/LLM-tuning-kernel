@@ -169,21 +169,27 @@ def main() -> None:
         from ktune.integrations import fused_causal_lm_loss
 
         class FLCETrainer(Trainer):
-            """Computes the LM loss with FusedLinearCrossEntropy.
+            """Computes the LM loss with FusedLinearCrossEntropy, with a safety net.
 
-            We temporarily swap the model's output embedding (``lm_head``) for a
-            hook that captures its *input* (the hidden states) and returns cheap
-            dummy logits, so the model never forms the full ``[batch, seq, vocab]``
-            logits tensor. The real loss is then computed from the hidden states +
-            LM-head weight via the chunked FLCE kernel.
+            We swap the model's output embedding (``lm_head``) for a hook that
+            captures its *input* (the hidden states) and returns dummy logits, so
+            the model never forms the full ``[batch, seq, vocab]`` tensor; the loss
+            is then computed from the hidden states + LM-head weight via the chunked
+            FLCE kernel.
+
+            On the **first step** we also compute the model's native loss and
+            compare: if they disagree (some model wiring doesn't expose hidden
+            states the way we assume), we print both and permanently fall back to
+            the native loss so training stays correct — you just don't get the
+            memory win. When they agree, FLCE is used for every step.
             """
 
-            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-                labels = inputs.pop("labels")
+            _flce_ok = None  # None = untested, True = use FLCE, False = fall back
+
+            def _flce_loss(self, model, inputs):
                 lm_head = model.get_output_embeddings()
                 if lm_head is None:
                     raise RuntimeError("model has no output embeddings; can't fuse the loss")
-
                 captured = {}
                 original_forward = lm_head.forward
 
@@ -193,23 +199,62 @@ def main() -> None:
 
                 lm_head.forward = capture
                 try:
-                    model(**inputs)
+                    model(**{k: v for k, v in inputs.items() if k != "labels"})
                 finally:
                     lm_head.forward = original_forward
-
                 if "hidden" not in captured:
                     raise RuntimeError("FLCE loss: the model never called its output embedding")
-                loss = fused_causal_lm_loss(
+                return fused_causal_lm_loss(
                     captured["hidden"],
                     lm_head.weight,
-                    labels,
+                    inputs["labels"],
                     bias=getattr(lm_head, "bias", None),
                     ignore_index=-100,
                     chunk_size=1024,
                 )
+
+            def compute_loss(
+                self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs
+            ):
+                # Validated-bad: use the model's native (correct) loss.
+                if FLCETrainer._flce_ok is False:
+                    return super().compute_loss(
+                        model, inputs, return_outputs, num_items_in_batch=num_items_in_batch
+                    )
+
+                loss = self._flce_loss(model, inputs)  # mean over valid tokens in microbatch
+                # Recent transformers passes num_items_in_batch and then does NOT divide
+                # the loss by gradient_accumulation_steps — it expects sum/num_items, not a
+                # per-microbatch mean. Convert ours to match, else the loss/grads are
+                # ~grad_accum× too large.
+                if num_items_in_batch is not None:
+                    n_valid = (inputs["labels"][..., 1:] != -100).sum().to(loss.dtype)
+                    loss = loss * n_valid / num_items_in_batch
+
+                if FLCETrainer._flce_ok is None:  # one-time validation vs native loss
+                    with torch.no_grad():
+                        native = super().compute_loss(
+                            model, dict(inputs), num_items_in_batch=num_items_in_batch
+                        )
+                    rel = (loss.detach() - native).abs() / native.abs().clamp(min=1e-6)
+                    FLCETrainer._flce_ok = bool(rel < 0.02)
+                    verdict = (
+                        "match — using FLCE (memory-efficient)"
+                        if FLCETrainer._flce_ok
+                        else "MISMATCH — falling back to the model's native loss"
+                    )
+                    print(
+                        f"[ktune] FLCE check: flce={loss.item():.4f} "
+                        f"native={native.item():.4f} -> {verdict}"
+                    )
+                    if not FLCETrainer._flce_ok:
+                        return super().compute_loss(
+                            model, inputs, return_outputs, num_items_in_batch=num_items_in_batch
+                        )
+
                 return (loss, {}) if return_outputs else loss
 
-        print("[ktune] loss fused via FusedLinearCrossEntropy (logits never materialised)")
+        print("[ktune] loss fused via FusedLinearCrossEntropy (self-checked on step 1)")
         trainer = FLCETrainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
     else:
         trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
