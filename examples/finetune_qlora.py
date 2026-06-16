@@ -213,11 +213,37 @@ def main() -> None:
                     chunk_size=1024,
                 )
 
+            def _validate(self, model, inputs):
+                # Validate the FLCE math on a SHORT slice so we never materialise
+                # full-size logits (which would re-inflate peak VRAM and hide the
+                # win). Compares the FLCE mean loss to the model's native mean loss.
+                k = min(128, inputs["labels"].shape[1])
+                sub = {
+                    key: (v[:, :k] if torch.is_tensor(v) and v.dim() >= 2 else v)
+                    for key, v in inputs.items()
+                }
+                with torch.no_grad():
+                    flce = self._flce_loss(model, sub)
+                    native = super().compute_loss(model, dict(sub))
+                rel = (flce - native).abs() / native.abs().clamp(min=1e-6)
+                ok = bool(rel < 0.02)
+                verdict = (
+                    "match — using FLCE (memory-efficient)"
+                    if ok
+                    else "MISMATCH — falling back to the model's native loss"
+                )
+                print(
+                    f"[ktune] FLCE check (first {k} tokens): "
+                    f"flce={flce.item():.4f} native={native.item():.4f} -> {verdict}"
+                )
+                return ok
+
             def compute_loss(
                 self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs
             ):
-                # Validated-bad: use the model's native (correct) loss.
-                if FLCETrainer._flce_ok is False:
+                if FLCETrainer._flce_ok is None:  # one-time, cheap validation
+                    FLCETrainer._flce_ok = self._validate(model, inputs)
+                if FLCETrainer._flce_ok is False:  # validated-bad: native (correct) loss
                     return super().compute_loss(
                         model, inputs, return_outputs, num_items_in_batch=num_items_in_batch
                     )
@@ -225,33 +251,11 @@ def main() -> None:
                 loss = self._flce_loss(model, inputs)  # mean over valid tokens in microbatch
                 # Recent transformers passes num_items_in_batch and then does NOT divide
                 # the loss by gradient_accumulation_steps — it expects sum/num_items, not a
-                # per-microbatch mean. Convert ours to match, else the loss/grads are
+                # per-microbatch mean. Convert ours to match, else loss/grads are
                 # ~grad_accum× too large.
                 if num_items_in_batch is not None:
                     n_valid = (inputs["labels"][..., 1:] != -100).sum().to(loss.dtype)
                     loss = loss * n_valid / num_items_in_batch
-
-                if FLCETrainer._flce_ok is None:  # one-time validation vs native loss
-                    with torch.no_grad():
-                        native = super().compute_loss(
-                            model, dict(inputs), num_items_in_batch=num_items_in_batch
-                        )
-                    rel = (loss.detach() - native).abs() / native.abs().clamp(min=1e-6)
-                    FLCETrainer._flce_ok = bool(rel < 0.02)
-                    verdict = (
-                        "match — using FLCE (memory-efficient)"
-                        if FLCETrainer._flce_ok
-                        else "MISMATCH — falling back to the model's native loss"
-                    )
-                    print(
-                        f"[ktune] FLCE check: flce={loss.item():.4f} "
-                        f"native={native.item():.4f} -> {verdict}"
-                    )
-                    if not FLCETrainer._flce_ok:
-                        return super().compute_loss(
-                            model, inputs, return_outputs, num_items_in_batch=num_items_in_batch
-                        )
-
                 return (loss, {}) if return_outputs else loss
 
         print("[ktune] loss fused via FusedLinearCrossEntropy (self-checked on step 1)")

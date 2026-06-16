@@ -85,17 +85,36 @@ First run, **`--ktune` patched RMSNorm + SwiGLU only** (loss still computed by H
   cancels the bandwidth they save. Memory-bound kernels need autotuning and a
   larger model to pull clearly ahead.
 
-Second run, **`--ktune` with the loss routed through FusedLinearCrossEntropy**:
-peak VRAM dropped **3.07 → 2.65 GB** (logits no longer materialised). The first
-attempt also exposed a real integration bug — the loss read ~7.3 instead of ~1.7
-because the custom `Trainer` returned a per-microbatch *mean* while recent
-transformers passes `num_items_in_batch` and skips the grad-accum division
-(expecting `sum / num_items`), making the loss/grads ~`grad_accum`× too large.
+Second run, **`--ktune` with the loss routed through FusedLinearCrossEntropy**
+(loss now **validated** — the trainer self-checks FLCE vs the model's native loss
+on a short slice and prints `flce=… native=… -> match`):
 
-**Fixed:** the `FLCETrainer` now honours `num_items_in_batch` and self-checks its
-loss against the model's native loss on step 1, falling back to the native loss
-if they ever diverge. Re-run `--ktune` for the corrected loss curve (should track
-the baseline) alongside the ~14% VRAM drop; try `--seq 2048` for a larger gap.
+| variant | train loss | throughput | peak VRAM |
+|---------|-----------:|-----------:|----------:|
+| baseline | 1.484 | 1,840 tok/s | 3.07 GB |
+| ktune (+ FLCE loss) | **1.483** | 1,324 tok/s | ~2.65 GB |
+
+**How to read this:**
+
+- **Correctness ✓.** The FLCE loss matches the model's native loss exactly
+  (step-1 self-check `flce=native`), and the curve tracks the baseline to the
+  third decimal (1.483 vs 1.484).
+- **Memory win ✓ but modest here.** Peak VRAM drops because the `[1024, 152k]`
+  logits + gradient are never materialised. (An earlier measurement read 3.00 GB
+  only because the self-check itself computed the full-seq native logits; it now
+  validates on a 128-token slice, so the peak reflects the true FLCE saving.)
+- **Slower at this scale**, ~28%. The chunked FLCE path (Triton CE looping a 152k
+  vocab) can't beat cuBLAS `lm_head` + native CE for a single 0.5B/1k-seq step.
+  **FLCE buys memory headroom, not speed** — its value is letting a larger
+  batch / sequence / vocab fit that would otherwise OOM. The win grows with
+  `vocab × seq`; try `--seq 2048` and watch the gap widen.
+
+> A real bug surfaced and was fixed along the way: the trainer first returned a
+> per-microbatch *mean* while recent transformers passes `num_items_in_batch` and
+> skips the grad-accum division (expecting `sum / num_items`), so the loss/grads
+> were ~`grad_accum`× too large (loss read ~7.3). The `FLCETrainer` now honours
+> `num_items_in_batch` and self-checks on step 1, falling back to the native loss
+> if it ever diverges.
 
 **Where the wins are largest** (run these to see them in isolation):
 
