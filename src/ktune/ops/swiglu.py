@@ -20,11 +20,20 @@ if HAS_TRITON:
     import triton
     import triton.language as tl
 
+    # Pure 1-D elementwise: both the block size and the warp count are free to
+    # tune, keyed on the total element count.
+    _CONFIGS = [
+        triton.Config({"BLOCK_SIZE": bs}, num_warps=w)
+        for bs in (1024, 2048, 4096)
+        for w in (2, 4, 8)
+    ]
+
     @triton.jit
     def _silu(x):
         # SiLU / swish: x * sigmoid(x).
         return x * tl.sigmoid(x)
 
+    @triton.autotune(configs=_CONFIGS, key=["n_elements"])
     @triton.jit
     def _swiglu_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -34,6 +43,7 @@ if HAS_TRITON:
         up = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         tl.store(out_ptr + offs, _silu(gate) * up, mask=mask)
 
+    @triton.autotune(configs=_CONFIGS, key=["n_elements"])
     @triton.jit
     def _swiglu_bwd_kernel(
         dout_ptr, gate_ptr, up_ptr, dgate_ptr, dup_ptr, n_elements, BLOCK_SIZE: tl.constexpr
@@ -61,7 +71,7 @@ class _SwiGLUTriton(torch.autograd.Function):
         out = torch.empty_like(gate)
         n = gate.numel()
         grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)  # noqa: E731
-        _swiglu_fwd_kernel[grid](gate, up, out, n, BLOCK_SIZE=1024)
+        _swiglu_fwd_kernel[grid](gate, up, out, n)  # BLOCK_SIZE chosen by autotune
         ctx.save_for_backward(gate, up)
         return out
 
@@ -73,7 +83,7 @@ class _SwiGLUTriton(torch.autograd.Function):
         dup = torch.empty_like(up)
         n = gate.numel()
         grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)  # noqa: E731
-        _swiglu_bwd_kernel[grid](dout, gate, up, dgate, dup, n, BLOCK_SIZE=1024)
+        _swiglu_bwd_kernel[grid](dout, gate, up, dgate, dup, n)  # BLOCK_SIZE via autotune
         return dgate, dup
 
 

@@ -61,6 +61,27 @@ def test_flash_attention_kernel(causal):
 
 
 @CUDA
+@pytest.mark.parametrize("causal", [True, False])
+def test_flash_attention_backward(causal):
+    # Fused Triton backward (dQ/dK/dV) vs autograd through the reference.
+    q = torch.randn(2, 4, 192, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(2, 4, 192, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+    v = torch.randn(2, 4, 192, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+    do = torch.randn_like(q)
+
+    out = flash_attention(q, k, v, causal=causal)
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), do)
+
+    qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    out_ref = ref.attention(qr, kr, vr, causal=causal)
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (qr, kr, vr), do.float())
+
+    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(dv.float(), dv_ref, atol=3e-2, rtol=3e-2)
+
+
+@CUDA
 def test_cross_entropy_kernel():
     logits = torch.randn(512, 32000, device="cuda", dtype=torch.float32, requires_grad=True)
     targets = torch.randint(0, 32000, (512,), device="cuda")

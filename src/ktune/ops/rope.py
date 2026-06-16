@@ -28,6 +28,11 @@ if HAS_TRITON:
     import triton
     import triton.language as tl
 
+    # One program per (batch, head, position) row; BLOCK covers a half-row, so we
+    # autotune the warp count keyed on head_dim.
+    _WARP_CONFIGS = [triton.Config({}, num_warps=w) for w in (1, 2, 4, 8)]
+
+    @triton.autotune(configs=_WARP_CONFIGS, key=["head_dim"])
     @triton.jit
     def _rope_kernel(
         x_ptr,  # [n_rows, head_dim]
